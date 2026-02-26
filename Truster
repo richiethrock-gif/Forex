@@ -1,0 +1,377 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/forex_trend_analyzer.py b/forex_trend_analyzer.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c80e6045eb24393fe89147b4d0fc2bfc51eb5124
+--- /dev/null
++++ b/forex_trend_analyzer.py
+@@ -0,0 +1,367 @@
++#!/usr/bin/env python3
++"""Forex market trend analyzer with multi-timeframe confluence and TP/SL zones."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import datetime as dt
++import json
++import statistics
++import sys
++import urllib.error
++import urllib.parse
++import urllib.request
++from dataclasses import dataclass
++from itertools import combinations
++from pathlib import Path
++from typing import Dict, Iterable, List, Mapping, Protocol, Sequence
++
++
++FRANKFURTER_API = "https://api.frankfurter.app"
++DEFAULT_CURRENCIES = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"]
++DEFAULT_TIMEFRAMES = ["1d", "4h", "1h"]
++
++
++@dataclass(frozen=True)
++class Candle:
++    timestamp: str
++    open: float
++    high: float
++    low: float
++    close: float
++
++
++@dataclass(frozen=True)
++class TimeframeSignal:
++    timeframe: str
++    score: float
++    trend: str
++    confidence: float
++    rsi: float
++    ema_fast: float
++    ema_slow: float
++    momentum: float
++    volatility: float
++
++
++@dataclass(frozen=True)
++class PairOutcome:
++    pair: str
++    trend: str
++    confidence: float
++    last_price: float
++    support: float
++    resistance: float
++    tp1: float
++    tp2: float
++    sl: float
++    risk_reward: float
++    expected_shift: str
++    timeframe_signals: Sequence[TimeframeSignal]
++
++
++class CandleProvider(Protocol):
++    def fetch_candles(self, base: str, quote: str, timeframe: str, samples: int) -> List[Candle]:
++        ...
++
++
++class FrankfurterProvider:
++    """Fetches daily closes and converts them to candles (OHLC=close)."""
++
++    def __init__(self, timeout: float = 10.0) -> None:
++        self.timeout = timeout
++
++    def fetch_candles(self, base: str, quote: str, timeframe: str, samples: int) -> List[Candle]:
++        if timeframe != "1d":
++            raise RuntimeError(
++                f"Frankfurter provider supports only 1d timeframe. Requested: {timeframe}. "
++                "Use --csv for lower/higher custom timeframes."
++            )
++
++        end = dt.date.today()
++        start = end - dt.timedelta(days=max(samples * 2, samples + 10))
++        params = urllib.parse.urlencode({"from": base, "to": quote})
++        url = f"{FRANKFURTER_API}/{start.isoformat()}..{end.isoformat()}?{params}"
++
++        try:
++            with urllib.request.urlopen(url, timeout=self.timeout) as response:
++                payload = json.load(response)
++        except (urllib.error.URLError, TimeoutError) as exc:
++            raise RuntimeError(f"Unable to fetch data for {base}/{quote}: {exc}") from exc
++
++        rates_by_day: Dict[str, Dict[str, float]] = payload.get("rates", {})
++        candles = [
++            Candle(timestamp=day, open=vals[quote], high=vals[quote], low=vals[quote], close=vals[quote])
++            for day, vals in sorted(rates_by_day.items())
++        ]
++        if len(candles) < 20:
++            raise RuntimeError(
++                f"Not enough data for {base}/{quote} ({len(candles)} points). Need >=20."
++            )
++        return candles[-samples:]
++
++
++class CsvProvider:
++    """CSV format: timestamp,pair,timeframe,open,high,low,close."""
++
++    def __init__(self, csv_path: str) -> None:
++        self._rows = self._load(csv_path)
++
++    @staticmethod
++    def _load(csv_path: str) -> Mapping[tuple[str, str], List[Candle]]:
++        data: Dict[tuple[str, str], List[Candle]] = {}
++        with Path(csv_path).open("r", encoding="utf-8", newline="") as handle:
++            reader = csv.DictReader(handle)
++            required = {"timestamp", "pair", "timeframe", "open", "high", "low", "close"}
++            if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
++                raise RuntimeError(
++                    "CSV must include headers: timestamp,pair,timeframe,open,high,low,close"
++                )
++            for row in reader:
++                pair = row["pair"].upper().strip()
++                timeframe = row["timeframe"].lower().strip()
++                key = (pair, timeframe)
++                data.setdefault(key, []).append(
++                    Candle(
++                        timestamp=row["timestamp"],
++                        open=float(row["open"]),
++                        high=float(row["high"]),
++                        low=float(row["low"]),
++                        close=float(row["close"]),
++                    )
++                )
++        for key in data:
++            data[key].sort(key=lambda c: c.timestamp)
++        return data
++
++    def fetch_candles(self, base: str, quote: str, timeframe: str, samples: int) -> List[Candle]:
++        key = (f"{base}/{quote}", timeframe.lower())
++        candles = self._rows.get(key)
++        if not candles:
++            raise RuntimeError(f"No CSV candles for {key[0]} at timeframe {timeframe}")
++        if len(candles) < 20:
++            raise RuntimeError(f"Need >=20 candles for {key[0]} {timeframe}, found {len(candles)}")
++        return candles[-samples:]
++
++
++class TrendAnalyzer:
++    def __init__(self, provider: CandleProvider) -> None:
++        self.provider = provider
++
++    @staticmethod
++    def _pct_change(old: float, new: float) -> float:
++        return 0.0 if old == 0 else (new - old) / old
++
++    @staticmethod
++    def _ema(values: Sequence[float], period: int) -> float:
++        if len(values) < period:
++            return values[-1]
++        alpha = 2 / (period + 1)
++        ema = statistics.mean(values[:period])
++        for v in values[period:]:
++            ema = (v * alpha) + (ema * (1 - alpha))
++        return ema
++
++    @staticmethod
++    def _rsi(closes: Sequence[float], period: int = 14) -> float:
++        if len(closes) <= period:
++            return 50.0
++        gains: List[float] = []
++        losses: List[float] = []
++        for i in range(1, len(closes)):
++            delta = closes[i] - closes[i - 1]
++            gains.append(max(delta, 0.0))
++            losses.append(max(-delta, 0.0))
++        avg_gain = statistics.mean(gains[-period:])
++        avg_loss = statistics.mean(losses[-period:])
++        if avg_loss == 0:
++            return 100.0
++        rs = avg_gain / avg_loss
++        return 100 - (100 / (1 + rs))
++
++    def _atr(self, candles: Sequence[Candle], period: int = 14) -> float:
++        if len(candles) < 2:
++            return 0.0
++        trs: List[float] = []
++        for i in range(1, len(candles)):
++            h = candles[i].high
++            l = candles[i].low
++            pc = candles[i - 1].close
++            tr = max(h - l, abs(h - pc), abs(l - pc))
++            trs.append(tr)
++        lookback = trs[-period:] if len(trs) >= period else trs
++        return statistics.mean(lookback) if lookback else 0.0
++
++    def _signal_for_timeframe(self, candles: Sequence[Candle], timeframe: str) -> TimeframeSignal:
++        closes = [c.close for c in candles]
++        ema_fast = self._ema(closes, period=12)
++        ema_slow = self._ema(closes, period=26)
++        macd = ema_fast - ema_slow
++        momentum = self._pct_change(closes[max(0, len(closes) - 20)], closes[-1])
++        volatility = statistics.stdev(
++            [self._pct_change(closes[i - 1], closes[i]) for i in range(1, len(closes))]
++        ) if len(closes) > 2 else 0.0
++        rsi = self._rsi(closes)
++
++        ema_component = (ema_fast - ema_slow) / max(closes[-1], 1e-9)
++        rsi_component = (rsi - 50.0) / 100.0
++        score = (ema_component * 0.4) + (momentum * 0.35) + (rsi_component * 0.25) + (macd * 0.05)
++
++        if score > 0.002:
++            trend = "bullish"
++        elif score < -0.002:
++            trend = "bearish"
++        else:
++            trend = "sideways"
++
++        confidence = min(0.98, max(0.2, abs(score) / (volatility + 1e-6)))
++        return TimeframeSignal(
++            timeframe=timeframe,
++            score=score,
++            trend=trend,
++            confidence=confidence,
++            rsi=rsi,
++            ema_fast=ema_fast,
++            ema_slow=ema_slow,
++            momentum=momentum,
++            volatility=volatility,
++        )
++
++    def analyze_pair(self, base: str, quote: str, timeframes: Sequence[str], samples: int) -> PairOutcome:
++        if not timeframes:
++            raise RuntimeError("At least one timeframe is required.")
++
++        per_tf: List[TimeframeSignal] = []
++        recent_candles: List[Candle] | None = None
++        for tf in timeframes:
++            candles = self.provider.fetch_candles(base, quote, tf, samples)
++            per_tf.append(self._signal_for_timeframe(candles, tf))
++            if recent_candles is None or len(candles) >= len(recent_candles):
++                recent_candles = candles
++
++        assert recent_candles is not None
++        last = recent_candles[-1].close
++        support = min(c.low for c in recent_candles[-20:])
++        resistance = max(c.high for c in recent_candles[-20:])
++        atr = max(self._atr(recent_candles), last * 0.0025)
++
++        weights = [1 / (i + 1) for i in range(len(per_tf))]
++        total_weight = sum(weights)
++        aggregate = sum(sig.score * w for sig, w in zip(per_tf, weights)) / total_weight
++        confidence = min(0.98, sum(sig.confidence * w for sig, w in zip(per_tf, weights)) / total_weight)
++
++        if aggregate > 0.0015:
++            trend = "bullish"
++            expected_shift = f"{base} strength likely vs {quote} with multi-timeframe confluence"
++            tp1 = min(resistance, last + atr * 1.2)
++            tp2 = last + atr * 2.1
++            sl = max(support, last - atr * 1.0)
++        elif aggregate < -0.0015:
++            trend = "bearish"
++            expected_shift = f"{base} weakness likely vs {quote} with multi-timeframe confluence"
++            tp1 = max(support, last - atr * 1.2)
++            tp2 = last - atr * 2.1
++            sl = min(resistance, last + atr * 1.0)
++        else:
++            trend = "sideways"
++            expected_shift = f"{base}/{quote} likely range-bound; wait for breakout confirmation"
++            tp1 = resistance
++            tp2 = resistance
++            sl = support
++
++        reward = abs(tp2 - last)
++        risk = abs(last - sl) or 1e-9
++        rr = reward / risk
++
++        return PairOutcome(
++            pair=f"{base}/{quote}",
++            trend=trend,
++            confidence=confidence,
++            last_price=last,
++            support=support,
++            resistance=resistance,
++            tp1=tp1,
++            tp2=tp2,
++            sl=sl,
++            risk_reward=rr,
++            expected_shift=expected_shift,
++            timeframe_signals=per_tf,
++        )
++
++    def analyze_currency_set(
++        self, currencies: Iterable[str], timeframes: Sequence[str], samples: int
++    ) -> List[PairOutcome]:
++        unique = sorted({c.upper() for c in currencies})
++        outcomes: List[PairOutcome] = []
++        for base, quote in combinations(unique, 2):
++            outcomes.append(self.analyze_pair(base, quote, timeframes=timeframes, samples=samples))
++        return sorted(outcomes, key=lambda o: (-o.confidence, -o.risk_reward, o.pair))
++
++
++def _format_table(outcomes: Sequence[PairOutcome]) -> str:
++    header = (
++        f"{'Pair':10} {'Trend':9} {'Conf':>6} {'Last':>12} {'S/R':>23} "
++        f"{'TP1':>10} {'TP2':>10} {'SL':>10} {'R:R':>6}  Outlook"
++    )
++    lines = [header, "-" * len(header)]
++    for item in outcomes:
++        lines.append(
++            f"{item.pair:10} {item.trend:9} {item.confidence:6.2f} {item.last_price:12.6f} "
++            f"{item.support:10.6f}/{item.resistance:10.6f} {item.tp1:10.6f} {item.tp2:10.6f} "
++            f"{item.sl:10.6f} {item.risk_reward:6.2f}  {item.expected_shift}"
++        )
++    return "\n".join(lines)
++
++
++def parse_args(argv: Sequence[str]) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Analyze FX trends with multi-timeframe confluence and TP/SL zones."
++    )
++    parser.add_argument("--currencies", nargs="+", default=DEFAULT_CURRENCIES)
++    parser.add_argument("--timeframes", nargs="+", default=DEFAULT_TIMEFRAMES)
++    parser.add_argument("--samples", type=int, default=120)
++    parser.add_argument("--top", type=int, default=20)
++    parser.add_argument(
++        "--csv",
++        help="Optional OHLC dataset. If supplied, supports any timeframe from CSV. "
++        "Format: timestamp,pair,timeframe,open,high,low,close",
++    )
++    return parser.parse_args(argv)
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    args = parse_args(argv or sys.argv[1:])
++    if args.samples < 20:
++        print("Error: --samples must be >= 20.", file=sys.stderr)
++        return 2
++
++    provider: CandleProvider
++    if args.csv:
++        provider = CsvProvider(args.csv)
++    else:
++        if any(tf != "1d" for tf in args.timeframes):
++            print(
++                "Error: API mode supports only 1d timeframe. Use --csv for intraday/multi-timeframe data.",
++                file=sys.stderr,
++            )
++            return 2
++        provider = FrankfurterProvider()
++
++    analyzer = TrendAnalyzer(provider)
++    try:
++        outcomes = analyzer.analyze_currency_set(args.currencies, args.timeframes, args.samples)
++    except RuntimeError as exc:
++        print(f"Analysis failed: {exc}", file=sys.stderr)
++        return 1
++
++    if not outcomes:
++        print("No pairs generated. Provide at least two currencies.", file=sys.stderr)
++        return 2
++
++    print(_format_table(outcomes[: args.top]))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+ 
+EOF
+)
