@@ -1,0 +1,1 @@
+{\n  "name": "forex-cli-tool",\n  "version": "1.0.0",\n  "description": "A Node.js CLI tool for forex trading.",\n  "main": "index.js",\n  "scripts": {\n    "build": "echo 'Building...'",\n    "test": "echo 'Running tests...'",\n    "release": "npm publish"\n  },\n  "author": "Richie Throck",\n  "license": "MIT",\n  "dependencies": {\n    // Add your dependencies here\n  }\n}
